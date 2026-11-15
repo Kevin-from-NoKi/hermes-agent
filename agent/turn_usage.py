@@ -13,7 +13,8 @@ from __future__ import annotations
 import logging
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from decimal import Decimal
+from typing import Any, Dict, List, Optional
 
 from agent.image_token_cost import calibrate_from_usage
 from agent.usage_anchor import capture_usage_anchor, set_usage_anchor
@@ -54,6 +55,60 @@ def _loop_mod():
     import agent.conversation_loop as _cl
 
     return _cl
+
+
+def _openrouter_generation_id(agent: Any, response: Any) -> Any:
+    """The OpenRouter generation id of *response*, or ``None`` off that route.
+
+    Only OpenRouter exposes a generation id whose cost can be fetched later;
+    stamping an id on other routes would create ledger rows nothing can settle.
+    """
+    if (getattr(agent, "provider", "") or "") != "openrouter":
+        return None
+    rid = getattr(response, "id", None)
+    return rid if isinstance(rid, str) and rid.strip() else None
+
+
+def _settle_order_budget(agent: Any, cost_delta: Optional[float]) -> None:
+    """Settle this call's cost-ceiling hold with the amount we just booked.
+
+    An unknown amount (``None``) keeps the worst-case hold in place — missing
+    usage is unknown cost, never free cost. Accounting must never abort a turn,
+    so the traceback goes to the log rather than to the caller.
+    """
+    if getattr(agent, "_pending_call_budget", None) is None:
+        return
+    from agent import cost_budget
+
+    try:
+        cost_budget.settle_pending_call(agent, None if cost_delta is None else Decimal(str(cost_delta)))
+    except Exception:  # a failed settlement must not fail the turn
+        logger.warning("Cost-ceiling settlement failed; the hold stays booked", exc_info=True)
+
+
+def _reconcile_and_settle_openrouter(agent: Any, response: Any, generation_id: Optional[str],
+                                     estimated_cost: Optional[float]) -> None:
+    """Reconcile an attributed OpenRouter response before releasing its order hold."""
+    if agent.provider != "openrouter":
+        _settle_order_budget(agent, estimated_cost)
+        return
+    actual = None
+    try:
+        from agent.openrouter_cost import reconcile_response
+        status, verified = reconcile_response(agent, response, generation_id)
+        if status == "duplicate":
+            # The generation ledger already owns this cost. A replay of its
+            # response must not spend a second order reservation.
+            from agent.cost_budget import release_pending_call
+            release_pending_call(agent)
+            return
+        if status == "reconciled":
+            actual = verified
+        elif status not in ("pending", "no_generation"):
+            logger.warning("OpenRouter generation cost not reconciled: %s", status)
+    except Exception:
+        logger.warning("OpenRouter generation cost reconciliation failed; charge remains pending", exc_info=True)
+    _settle_order_budget(agent, actual)
 
 
 def _fold_moa_usage(agent, canonical_usage):
@@ -107,6 +162,9 @@ def record_response_usage(
             "API call #%d: model=%s provider=%s in=? out=? total=? latency=%.1fs usage=unavailable",
             agent.session_api_calls, agent.model, agent.provider or "unknown", api_duration,
         )
+        # An absent usage envelope is not a zero-cost response. Do not let the
+        # next attempt accidentally settle this call's pending handle.
+        _settle_order_budget(agent, None)
         return ResponseUsageOutcome(compression_attempts=compression_attempts, rearmed=rearmed)
 
     canonical_usage = with_served_service_tier(
@@ -266,6 +324,7 @@ def record_response_usage(
     # accounting; gateway/session-store writes use absolute totals and safely overwrite
     # these deltas. Enqueued, not written (a cold state.db UPDATE here stalled the tool
     # loop); drained at finalize via _persist_session.
+    _generation_id = _openrouter_generation_id(agent, response)
     if agent._session_db and agent.session_id:
         try:
             # Ensure the row exists: under concurrent SQLite load the initial
@@ -290,12 +349,20 @@ def record_response_usage(
                 model=agent.model,
                 api_call_count=1,
                 task=getattr(agent, "_turn_route_task", "") or "",
+                # OpenRouter answers with a generation id: it makes this call a
+                # single billable event that can be reconciled to its real cost
+                # exactly once (issue #13). Other routes have no such ledger and
+                # must not invent an id.
+                generation_id=_generation_id,
             )
         except Exception as e:  # silent loss here undercounts analytics
             logger.debug(
                 "Token persistence failed (session=%s, tokens=%d): %s",
                 agent.session_id, total_tokens, e,
             )
+
+    # Unknown metadata leaves the hold in place rather than trusting estimates.
+    _reconcile_and_settle_openrouter(agent, response, _generation_id, _cost_delta)
 
     if agent.verbose_logging:
         logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")

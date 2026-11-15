@@ -351,7 +351,10 @@ class InsightsEngine:
         def _accumulate(model, provider, base_url, session_id, counts: dict[str, int], *,
                         stored_cost=None, actual_cost=None, cost_status=None):
             model = model or "unknown"
-            d: dict[str, Any] = model_data[_short_model(model)]
+            # A display name is not a billing identity: the same model may be
+            # billed by several providers (or distinct endpoints) in one run.
+            key = (model, provider or "", base_url or "")
+            d: dict[str, Any] = model_data[key]
             d["sessions"].add(session_id)
             for key in _TOKEN_KEYS + ("reasoning_tokens",):
                 d[key] += counts[key]
@@ -364,7 +367,15 @@ class InsightsEngine:
                 estimate, status = float(stored_cost or 0.0), cost_status or "unknown"
             d["cost"] += estimate
             d["actual_cost"] += float(actual_cost or 0.0)
-            d["cost_status"] = status
+            prior = d.get("cost_status")
+            if prior is None or prior == status:
+                d["cost_status"] = status
+            elif "unknown" in (prior, status):
+                d["cost_status"] = "unknown"
+            elif "estimated" in (prior, status):
+                d["cost_status"] = "estimated"
+            else:
+                d["cost_status"] = "estimated"  # mixed included/actual is not wholly actual
             d["has_pricing"] = has_known_pricing(model, provider or None, base_url) or d.get("has_pricing", False)
         usage_totals = defaultdict(lambda: dict.fromkeys(count_keys, 0) | {"estimated_cost_usd": 0.0, "actual_cost_usd": 0.0})
         for r in self._get_model_usage(cutoff, source):
@@ -391,12 +402,14 @@ class InsightsEngine:
                             stored_cost=residual_cost, actual_cost=residual_actual, cost_status=s.get("cost_status"))
         for s in sessions:
             if s.get("tool_call_count"):
-                model_data[_short_model(s.get("model"))]["tool_calls"] += s["tool_call_count"]
+                key = (s.get("model") or "unknown", s.get("billing_provider") or "", s.get("billing_base_url") or "")
+                model_data[key]["tool_calls"] += s["tool_call_count"]
         # Models seen only via tool-call attribution never hit _accumulate —
         # default has_pricing/cost_status so the output shape is uniform for JSON consumers.
         defaults = (("has_pricing", False), ("cost_status", "unknown"))
-        result = [{"model": model, **data, "sessions": len(data["sessions"]), **{k: v for k, v in defaults if k not in data}}
-                  for model, data in model_data.items()]
+        result = [{"model": _short_model(model), "provider": provider, "billing_base_url": base_url,
+                   **data, "sessions": len(data["sessions"]), **{k: v for k, v in defaults if k not in data}}
+                  for (model, provider, base_url), data in model_data.items()]
         return sorted(result, key=lambda x: (x["total_tokens"], x["sessions"]), reverse=True)
 
     def _compute_platform_breakdown(self, sessions: list[dict]) -> list[dict]:

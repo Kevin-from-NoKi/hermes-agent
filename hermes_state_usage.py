@@ -7,6 +7,7 @@ import asyncio
 import atexit
 import contextlib
 import logging
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import threading
 import time
 import weakref
@@ -16,6 +17,26 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger("hermes_state")
 
 _TOKEN_COUNTERS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens", "reasoning_tokens")
+
+# Money in the cost-ceiling tables is exact decimal text, six fractional digits.
+_MICRO_USD = Decimal("0.000001")
+
+
+def _money_usd(value: Any) -> Decimal:
+    """Parse a user/provider supplied amount as a finite, non-negative decimal.
+
+    Rejects bools, NaN/Infinity and garbage: an unparseable amount must never
+    degrade into a free call.
+    """
+    if isinstance(value, bool) or value is None:
+        raise ValueError("cost amount must be a finite non-negative decimal")
+    try:
+        amount = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError) as exc:
+        raise ValueError("cost amount must be a finite non-negative decimal") from exc
+    if not amount.is_finite() or amount < 0:
+        raise ValueError("cost amount must be a finite non-negative decimal")
+    return amount.quantize(_MICRO_USD, rounding=ROUND_HALF_UP)
 
 
 def _token_update_sql(delta: bool) -> str:
@@ -239,7 +260,7 @@ class SessionUsageMixin:
         groups: list[tuple[Optional[tuple], str, dict[str, Any]]] = []
         for session_id, kwargs in batch:
             key = None
-            if not kwargs.get("absolute"):
+            if not kwargs.get("absolute") and not kwargs.get("generation_id"):
                 key = (session_id, *(kwargs.get(f) for f in self._TOKEN_DELTA_ROUTE_FIELDS))
             if groups and key is not None and groups[-1][0] == key:
                 merged = groups[-1][2]
@@ -309,7 +330,7 @@ class SessionUsageMixin:
         actual_cost_usd: Optional[float]=None, cost_status: Optional[str]=None, cost_source: Optional[str]=None,
         pricing_version: Optional[str]=None, billing_provider: Optional[str]=None, billing_base_url: Optional[str]=None,
         billing_mode: Optional[str]=None, api_call_count: int=0, absolute: bool=False,
-        source: Optional[str]=None, task: str = "",
+        source: Optional[str]=None, task: str = "", generation_id: Optional[str] = None,
     ) -> None:
         """Update totals and route attribution, ensuring the legacy missing-row backfill.
         *absolute*=False increments (per-API-call deltas, CLI path); *absolute*=True sets directly
@@ -335,8 +356,29 @@ class SessionUsageMixin:
         actual_cost_usd: Optional[float]=None, cost_status: Optional[str]=None, cost_source: Optional[str]=None,
         pricing_version: Optional[str]=None, billing_provider: Optional[str]=None, billing_base_url: Optional[str]=None,
         billing_mode: Optional[str]=None, api_call_count: int=0, absolute: bool=False, task: str="",
+        generation_id: Optional[str]=None,
     ) -> None:
         usage = {k: v for k, v in locals().items() if k in _MODEL_USAGE_FIELDS}
+        if generation_id and billing_provider == "openrouter":
+            # Claim the ID in the SAME transaction as the token/estimate delta.
+            # A replay of the response is not a second charge or a second call.
+            previous = conn.execute(
+                "SELECT session_id, model, billing_base_url, task FROM openrouter_generation_costs "
+                "WHERE generation_id=?", (generation_id,),
+            ).fetchone()
+            identity = (session_id, model or "", billing_base_url or "", task or "")
+            if previous is not None:
+                if tuple(previous) != identity:
+                    raise ValueError("OpenRouter generation belongs to a different route")
+                return
+            if not model or absolute or api_call_count != 1:
+                raise ValueError("OpenRouter generation needs one attributed incremental call")
+            conn.execute(
+                "INSERT INTO openrouter_generation_costs "
+                "(generation_id, session_id, model, billing_base_url, billing_mode, task, "
+                "estimated_cost_usd, first_seen) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (generation_id, *identity[:3], billing_mode or "", identity[3], estimated_cost_usd, time.time()),
+            )
         sql = _TOKEN_UPDATE_ABSOLUTE_SQL if absolute else _TOKEN_UPDATE_DELTA_SQL
         has_usage = bool(input_tokens or output_tokens or cache_read_tokens or cache_write_tokens or reasoning_tokens
                          or api_call_count or estimated_cost_usd)
@@ -401,6 +443,10 @@ class SessionUsageMixin:
             "SELECT model, billing_provider, billing_base_url, billing_mode FROM sessions WHERE id = ?", (session_id,),
         ).fetchone()
         sess = dict(row) if (row is not None and not task) else {}
+        # Never borrow the first route's subscription mode or endpoint for a
+        # different provider. A session summary is not a route fallback here.
+        if billing_provider and billing_provider != sess.get("billing_provider"):
+            sess = {}
         counts = [v or 0 for v in (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens)]
         now = time.time()
         conn.execute(_MODEL_USAGE_UPSERT_SQL, (
@@ -409,6 +455,271 @@ class SessionUsageMixin:
             billing_base_url or sess.get("billing_base_url") or "",
             billing_mode or sess.get("billing_mode") or "", task or "", api_call_count or 0, *counts,
             float(estimated_cost_usd or 0.0), float(actual_cost_usd or 0.0), cost_status, cost_source, now, now))
+
+    def reconcile_openrouter_generation_cost(self, generation_id: str, metadata: Optional[dict]) -> str:
+        """Settle one already-attributed generation from a verified OpenRouter API reply.
+
+        No HTTP is performed here. A present ``total_cost`` is the amount
+        charged by OpenRouter, including any BYOK platform fee; absent or
+        unparseable cost is not free usage.
+        All ledger and aggregate changes commit together; repeated or conflicting
+        replies never add another charge. Returns a result code for retry/reporting.
+        """
+        if not self.flush_token_counts():
+            raise RuntimeError("Token accounting has not settled; refusing cost reconciliation")
+        data = metadata.get("data", metadata) if isinstance(metadata, dict) else None
+        if not isinstance(data, dict):
+            data = {}
+        reported = data.get("total_cost")
+        cost = None
+        if not isinstance(reported, bool) and isinstance(reported, (int, float, str)):
+            try:
+                cost = Decimal(str(reported))
+                if not cost.is_finite() or cost < 0:
+                    cost = None
+            except (InvalidOperation, ValueError):
+                cost = None
+
+        def _settle(conn):
+            row = conn.execute(
+                "SELECT * FROM openrouter_generation_costs WHERE generation_id=?",
+                (generation_id,),
+            ).fetchone()
+            if row is None:
+                return "missing"
+            route = dict(row)
+            # The response may name an alias (openrouter/auto), whereas the
+            # generation metadata names the actually served upstream model.
+            if cost is None:
+                return "pending"
+            if data.get("id") != generation_id:
+                return "conflict"
+            if route["actual_cost_usd"] is not None:
+                return "duplicate" if Decimal(route["actual_cost_usd"]) == cost else "conflict"
+            amount = float(cost)
+            if amount == float("inf"):
+                return "pending"  # never insert an unrepresentable float into totals
+            conn.execute(
+                "UPDATE openrouter_generation_costs SET actual_cost_usd=?, cost_source=?, reconciled_at=? "
+                "WHERE generation_id=? AND actual_cost_usd IS NULL",
+                (str(cost), "openrouter_generation_api", time.time(), generation_id),
+            )
+            route_key = (route["session_id"], route["model"], "openrouter",
+                         route["billing_base_url"], route["billing_mode"], route["task"])
+            updated = conn.execute(
+                "UPDATE session_model_usage SET actual_cost_usd=actual_cost_usd+? "
+                "WHERE session_id=? AND model=? AND billing_provider=? "
+                "AND billing_base_url=? AND billing_mode=? AND task=?",
+                (amount, *route_key),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError("OpenRouter ledger route missing; transaction rolled back")
+            conn.execute(
+                "UPDATE sessions SET actual_cost_usd=COALESCE(actual_cost_usd,0)+? WHERE id=?",
+                (amount, route["session_id"]),
+            )
+            # Never mark a route/sum actual while a call lacks final metadata,
+            # including older route calls which have no generation ledger entry.
+            counts = conn.execute(
+                "SELECT COUNT(*) AS n, SUM(CASE WHEN actual_cost_usd IS NOT NULL THEN 1 ELSE 0 END) AS done "
+                "FROM openrouter_generation_costs WHERE session_id=? AND model=? "
+                "AND billing_base_url=? AND billing_mode=? AND task=?",
+                (route["session_id"], route["model"], route["billing_base_url"],
+                 route["billing_mode"], route["task"]),
+            ).fetchone()
+            usage = conn.execute(
+                "SELECT api_call_count FROM session_model_usage WHERE session_id=? AND model=? "
+                "AND billing_provider='openrouter' AND billing_base_url=? AND billing_mode=? AND task=?",
+                (route["session_id"], route["model"], route["billing_base_url"],
+                 route["billing_mode"], route["task"]),
+            ).fetchone()
+            if usage[0] == counts["n"] == counts["done"]:
+                conn.execute(
+                    "UPDATE session_model_usage SET cost_status='actual', cost_source='openrouter_generation_api' "
+                    "WHERE session_id=? AND model=? AND billing_provider='openrouter' "
+                    "AND billing_base_url=? AND billing_mode=? AND task=?",
+                    (route["session_id"], route["model"], route["billing_base_url"],
+                     route["billing_mode"], route["task"]),
+                )
+            unsettled = conn.execute(
+                "SELECT COUNT(*) FROM session_model_usage WHERE session_id=? "
+                "AND (cost_status IS NULL OR cost_status NOT IN ('actual','included'))",
+                (route["session_id"],),
+            ).fetchone()[0]
+            conn.execute("UPDATE sessions SET cost_status=? WHERE id=?",
+                         ("estimated" if unsettled else "actual", route["session_id"]),
+            )
+            return "reconciled"
+
+        return self._execute_write(_settle)
+
+    # ------------------------------------------------------------------
+    # Order-scoped cost ceiling (issue #13, Arbeitspaket C).
+    #
+    # The money for a call is taken out of the order budget BEFORE the provider
+    # is called ("reserve") and settled to the real amount afterwards. A pure
+    # after-the-fact sum cannot stop the call that overspends it. Reservations
+    # are durable rows, so a crash or restart leaves the money held rather than
+    # silently handing the order a fresh budget.
+    # ------------------------------------------------------------------
+
+    def ensure_cost_order(self, order_id: str, *, limit_usd: Any) -> str:
+        """Create the order's ceiling once; an existing order keeps its limit and spend.
+
+        Re-declaring an order must never re-arm the budget (a restart or a model
+        switch cannot reset what was already spent). Returns ``created``/``exists``.
+        """
+        if not isinstance(order_id, str) or not order_id.strip():
+            raise ValueError("order_id must be a non-empty string")
+        limit = _money_usd(limit_usd)
+        now = time.time()
+
+        def _create(conn):
+            row = conn.execute("SELECT limit_usd FROM cost_orders WHERE order_id=?", (order_id,)).fetchone()
+            if row is not None:
+                return "exists"
+            conn.execute(
+                "INSERT INTO cost_orders (order_id, limit_usd, spent_usd, reserved_usd, created_at, updated_at) "
+                "VALUES (?, ?, '0.000000', '0.000000', ?, ?)",
+                (order_id, str(limit), now, now),
+            )
+            return "created"
+
+        return self._execute_write(_create)  # type: ignore[attr-defined]
+
+    def get_cost_order(self, order_id: str) -> Optional[dict[str, Any]]:
+        """Read-only view: ceiling, charged spend, held reservations, overspent flag."""
+        rows = self._read_all(
+            "SELECT limit_usd, spent_usd, reserved_usd FROM cost_orders WHERE order_id=?", (order_id,),
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        spent, reserved = Decimal(row["spent_usd"]), Decimal(row["reserved_usd"])
+        return {
+            "order_id": order_id,
+            "limit_usd": row["limit_usd"],
+            "spent_usd": row["spent_usd"],
+            "reserved_usd": row["reserved_usd"],
+            "available_usd": str(Decimal(row["limit_usd"]) - spent - reserved),
+            "overspent": spent > Decimal(row["limit_usd"]),
+        }
+
+    def reserve_call_cost(
+        self, order_id: str, reservation_id: str, worst_case_usd: Any, *, session_id: str = "",
+    ) -> str:
+        """Atomically hold *worst_case_usd* against the order before a paid call.
+
+        Returns ``reserved`` (this caller owns the hold), ``duplicate`` (same hold
+        replayed), ``exceeds_limit`` (call must not happen) or ``unknown_order``
+        (no configured ceiling for that order — the caller decides, this layer
+        never invents a budget).
+        """
+        if not isinstance(reservation_id, str) or not reservation_id.strip():
+            raise ValueError("reservation_id must be a non-empty string")
+        amount = _money_usd(worst_case_usd)
+        now = time.time()
+
+        def _reserve(conn):
+            row = conn.execute(
+                "SELECT limit_usd, spent_usd, reserved_usd FROM cost_orders WHERE order_id=?", (order_id,),
+            ).fetchone()
+            if row is None:
+                return "unknown_order"
+            existing = conn.execute(
+                "SELECT order_id, worst_case_usd, status FROM cost_reservations WHERE reservation_id=?",
+                (reservation_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["order_id"] != order_id or Decimal(existing["worst_case_usd"]) != amount:
+                    raise ValueError("reservation_id already belongs to a different hold")
+                return "duplicate"
+            limit, spent, reserved = (
+                Decimal(row["limit_usd"]), Decimal(row["spent_usd"]), Decimal(row["reserved_usd"]),
+            )
+            if spent + reserved + amount > limit:
+                return "exceeds_limit"
+            conn.execute(
+                "INSERT INTO cost_reservations "
+                "(reservation_id, order_id, session_id, worst_case_usd, status, created_at) "
+                "VALUES (?, ?, ?, ?, 'reserved', ?)",
+                (reservation_id, order_id, session_id or "", str(amount), now),
+            )
+            conn.execute(
+                "UPDATE cost_orders SET reserved_usd=?, updated_at=? WHERE order_id=?",
+                (str(reserved + amount), now, order_id),
+            )
+            return "reserved"
+
+        return self._execute_write(_reserve)  # type: ignore[attr-defined]
+
+    def settle_call_cost(self, order_id: str, reservation_id: str, actual_usd: Any) -> str:
+        """Convert a hold into real spend, once.
+
+        The ACTUAL amount is booked even when it exceeds the reserve (the
+        provider already charged it); the reserve merely decides admission.
+        Returns ``settled``/``duplicate``/``conflict``/``missing``.
+        """
+        amount = _money_usd(actual_usd)
+        now = time.time()
+
+        def _settle(conn):
+            row = conn.execute(
+                "SELECT order_id, worst_case_usd, actual_usd, status FROM cost_reservations WHERE reservation_id=?",
+                (reservation_id,),
+            ).fetchone()
+            if row is None or row["order_id"] != order_id:
+                return "missing"
+            if row["status"] == "settled":
+                return "duplicate" if Decimal(row["actual_usd"]) == amount else "conflict"
+            if row["status"] == "released":
+                return "conflict"
+            order = conn.execute(
+                "SELECT spent_usd, reserved_usd FROM cost_orders WHERE order_id=?", (order_id,),
+            ).fetchone()
+            held, spent, reserved = Decimal(row["worst_case_usd"]), Decimal(order["spent_usd"]), Decimal(order["reserved_usd"])
+            conn.execute(
+                "UPDATE cost_reservations SET status='settled', actual_usd=?, settled_at=? WHERE reservation_id=?",
+                (str(amount), now, reservation_id),
+            )
+            conn.execute(
+                "UPDATE cost_orders SET spent_usd=?, reserved_usd=?, updated_at=? WHERE order_id=?",
+                (str(spent + amount), str(max(reserved - held, Decimal(0))), now, order_id),
+            )
+            return "settled"
+
+        return self._execute_write(_settle)  # type: ignore[attr-defined]
+
+    def release_call_cost(self, order_id: str, reservation_id: str) -> str:
+        """Give a hold back after a call that never reached the provider (once)."""
+        now = time.time()
+
+        def _release(conn):
+            row = conn.execute(
+                "SELECT order_id, worst_case_usd, status FROM cost_reservations WHERE reservation_id=?",
+                (reservation_id,),
+            ).fetchone()
+            if row is None or row["order_id"] != order_id:
+                return "missing"
+            if row["status"] == "released":
+                return "duplicate"
+            if row["status"] == "settled":
+                return "conflict"
+            order = conn.execute(
+                "SELECT reserved_usd FROM cost_orders WHERE order_id=?", (order_id,),
+            ).fetchone()
+            held, reserved = Decimal(row["worst_case_usd"]), Decimal(order["reserved_usd"])
+            conn.execute(
+                "UPDATE cost_reservations SET status='released', settled_at=? WHERE reservation_id=?",
+                (now, reservation_id),
+            )
+            conn.execute(
+                "UPDATE cost_orders SET reserved_usd=?, updated_at=? WHERE order_id=?",
+                (str(max(reserved - held, Decimal(0))), now, order_id),
+            )
+            return "released"
+
+        return self._execute_write(_release)  # type: ignore[attr-defined]
 
     def record_auxiliary_usage(
         self, session_id: str, task: str, *, model: Optional[str]=None, billing_provider: Optional[str]=None,

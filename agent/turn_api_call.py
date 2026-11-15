@@ -91,6 +91,19 @@ def perform_api_call(
     _use_streaming = _should_stream(agent)
 
     def _perform_api_call(next_api_kwargs):
+        # Cost ceiling (#13): the worst-case price of THIS call is held against the
+        # order budget before the provider is contacted. Refusal raises, so an
+        # exhausted or unbounded route never becomes a free call.
+        from agent import cost_budget
+        _budget = None
+        if cost_budget.order_id_for(agent) is not None:
+            _budget = cost_budget.reserve_for_call(
+                agent,
+                prompt_tokens=cost_budget.estimate_prompt_tokens(
+                    next_api_kwargs, fallback=int(getattr(agent, "_last_prompt_size_tokens", 0) or 0),
+                ),
+                max_output_tokens=cost_budget.estimate_max_output_tokens(next_api_kwargs),
+            )
         if agent.api_mode == "codex_responses":
             from agent.codex_responses_adapter import drops_replay_item_ids
 
@@ -98,32 +111,40 @@ def perform_api_call(
                 next_api_kwargs, allow_stream=False, drop_replay_item_ids=drops_replay_item_ids(agent.base_url),
                 sanitize_harmony_tokens=agent._is_codex_backend(),
             )
-        if _use_streaming:
-            return agent._interruptible_streaming_api_call(
-                next_api_kwargs, on_first_delta=_stop_spinner
-            )
-        from agent import relay_llm
+        try:
+            if _use_streaming:
+                return agent._interruptible_streaming_api_call(
+                    next_api_kwargs, on_first_delta=_stop_spinner
+                )
+            from agent import relay_llm
 
-        return relay_llm.execute(
-            next_api_kwargs,
-            agent._interruptible_api_call,
-            session_id=str(agent.session_id or ""),
-            name=str(agent.provider or "provider"),
-            model_name=str(agent.model or ""),
-            metadata={
-                "api_mode": agent.api_mode,
-                "api_request_id": api_request_id,
-                "call_role": (
-                    "delegated"
-                    if getattr(agent, "is_subagent", False)
-                    else "fallback"
-                    if int(getattr(agent, "_fallback_index", 0) or 0) > 0
-                    else "primary"
-                ),
-                "retry_count": retry_count,
-            },
-            defer_logical_completion=True,
-        )
+            return relay_llm.execute(
+                next_api_kwargs,
+                agent._interruptible_api_call,
+                session_id=str(agent.session_id or ""),
+                name=str(agent.provider or "provider"),
+                model_name=str(agent.model or ""),
+                metadata={
+                    "api_mode": agent.api_mode,
+                    "api_request_id": api_request_id,
+                    "call_role": (
+                        "delegated"
+                        if getattr(agent, "is_subagent", False)
+                        else "fallback"
+                        if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                        else "primary"
+                    ),
+                    "retry_count": retry_count,
+                },
+                defer_logical_completion=True,
+            )
+        except BaseException:
+            # A transport error/interrupt does NOT prove the provider never
+            # accepted the request. Keep the durable hold until a verified
+            # no-charge result can release it; never silently re-arm the budget.
+            if _budget is not None:
+                agent._pending_call_budget = None
+            raise
 
     from hermes_cli.middleware import run_llm_execution_middleware
 

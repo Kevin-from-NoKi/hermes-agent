@@ -401,6 +401,13 @@ class AIAgent(
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
+        # Cost ceiling (#13): the order this run spends from (None = no ceiling
+        # configured) and the hold for the call currently in flight. Reset here,
+        # with the rest of the session state, so a new session never inherits the
+        # previous order's budget or an orphaned reservation.
+        self._cost_order_id = None
+        self._cost_order_disabled = False
+        self._pending_call_budget = None
 
         # Session boundary: the usage anchor describes the OLD transcript; fall back to full estimation.
         self._usage_anchor = None

@@ -129,6 +129,39 @@ MCP servers, builds) keep glibc's default. An explicit `MALLOC_ARENA_MAX` (or
 before launch or set in the profile's `.env`. Set the value to `0`, `false`, or `null` to keep
 glibc's default. Other platforms ignore it.
 
+## Cost Limits
+
+The experimental `cost_limits:` section provides pre-call admission control
+for the main agent loop. It is **off by default**: Hermes ships no dollar amount.
+This is **not yet a hard order-wide spend cap**; do not rely on it as the sole
+protection for a paid account.
+
+```yaml
+cost_limits:
+  enabled: true
+  order_limit_usd: 2.50        # your decision, per task/session
+```
+
+How it currently works: before a main-loop call, an estimated upper price
+(prompt-size approximation and the configured output allowance) is held in
+`state.db` in one transaction. Parallel calls using that store share the hold;
+delegated subagents inherit an order ID. An exhausted order or an unpriced
+route refuses the main-loop call. OpenRouter's reported charge is reconciled
+by generation ID when available; a missing charge retains the hold. An ambiguous
+transport failure also retains the hold rather than assuming no charge.
+
+The prompt approximation is not a proven token upper bound, and provider rates,
+media/server-tool fees, MoA fan-out and auxiliary calls can exceed or bypass the
+estimate. The managed worker session store does not yet implement the order
+ledger methods. Provider-side spend limits, preferably on a dedicated key or
+workspace, are needed for an externally enforced limit. A provider overage is
+booked in full and blocks later admitted calls, not the already charged one.
+
+A configured order is the session (`session:<session_id>`), so a restart resumes
+the same budget instead of re-arming it. Delegated subagents inherit the
+parent's order. `cost_limits.enabled: false` disables the check without deleting
+the recorded spend.
+
 ## Database Settings
 
 The `database:` section controls how Hermes opens its SQLite state database

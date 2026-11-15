@@ -54,3 +54,26 @@ def test_worker_voice_turn_usage_counts_but_never_rewrites_the_session_route(tmp
         assert db.auxiliary_usage_by_task('s')['voice_chat']['input_tokens'] == 10
     finally:
         db.close()
+
+
+def test_worker_main_usage_accepts_generation_id_and_deduplicates(tmp_path):
+    """A managed worker books the OpenRouter generation exactly once.
+
+    The worker receipt is the only write path for gateway sessions; a payload
+    field it refuses would drop the whole token delta, not just the ledger id.
+    """
+    db = SessionDB(tmp_path / 'state.db')
+    try:
+        db.create_session('s', source='cli')
+        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        scope = dict(epoch=epoch, execution_id='w', session_id='s', generation=0)
+        rt.register_worker_execution(db, **scope, kind='compute', adoption_secret='private')
+        payload = {'input_tokens': 13, 'api_call_count': 1, 'model': 'vendor/model',
+                   'billing_provider': 'openrouter', 'generation_id': 'gen-worker'}
+        rt.mutate_worker_execution(db, **scope, sequence=1, operation='usage.main', payload=payload)
+        rt.mutate_worker_execution(db, **scope, sequence=2, operation='usage.main', payload=payload)
+        assert db.get_session('s')['api_call_count'] == 1
+        ledger = db._read_all('SELECT generation_id FROM openrouter_generation_costs', ())
+        assert [row['generation_id'] for row in ledger] == ['gen-worker']
+    finally:
+        db.close()

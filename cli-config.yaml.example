@@ -49,6 +49,19 @@ runtime:
   malloc_arena_max: 4
 
 # =============================================================================
+# Cost Limits
+# =============================================================================
+# Caps what one task ("order", normally the session) may spend on paid model
+# calls. Off by default: no dollar amount ships with Hermes.
+# Before each paid call the worst-case price is held against the order budget
+# and settled to the real cost afterwards; an exhausted order, or a route
+# without pricing data, stops the call. Delegated subagents inherit the order.
+#
+# cost_limits:
+#   enabled: true
+#   order_limit_usd: 2.50
+
+# =============================================================================
 # Attachments
 # =============================================================================
 # Where the TUI/Desktop gateway stages session file attachments (file uploads and

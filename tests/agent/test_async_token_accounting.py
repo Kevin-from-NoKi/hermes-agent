@@ -536,7 +536,10 @@ class TestCoalesceFieldContract:
             set(db._TOKEN_DELTA_SUM_FIELDS)
             | set(db._TOKEN_DELTA_COST_FIELDS)
             | set(db._TOKEN_DELTA_ROUTE_FIELDS)
-            | {"absolute"}  # control flag: absolute deltas never merge
+            # control flags: absolute deltas never merge, and a delta carrying an
+            # OpenRouter generation id must be applied on its own so the id is
+            # claimed (and deduplicated) in its own transaction (#13).
+            | {"absolute", "generation_id"}
         )
 
         unclassified = params - classified

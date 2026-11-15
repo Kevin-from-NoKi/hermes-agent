@@ -342,6 +342,12 @@ def _build_child_agent(
             effective_requested_provider=rt.get("requested_provider"),
         )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    # Cost ceiling (#13): a delegated run spends from the parent's order budget.
+    # It must never mint a fresh one — parallel children would each get a full
+    # ceiling and the parent's limit would multiply by the fan-out width.
+    _parent_order = getattr(parent_agent, "_cost_order_id", None)
+    if isinstance(_parent_order, str) and _parent_order.strip():
+        child._cost_order_id = _parent_order
     _apply_child_cache_ttl(child)
     if child_session_db is not None:
         child._owns_session_db = True  # released by the child's close(), never by the parent
