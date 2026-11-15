@@ -129,6 +129,36 @@ MCP servers, builds) keep glibc's default. An explicit `MALLOC_ARENA_MAX` (or
 before launch or set in the profile's `.env`. Set the value to `0`, `false`, or `null` to keep
 glibc's default. Other platforms ignore it.
 
+## Cost Limits
+
+The `cost_limits:` section caps what a single task ("order") may spend on paid
+model calls. It is **off by default**: Hermes ships no dollar amount, and
+nothing is enforced until you configure one.
+
+```yaml
+cost_limits:
+  enabled: true
+  order_limit_usd: 2.50        # your decision, per task/session
+```
+
+How it is enforced: before every paid call the worst-case price of that call
+(the whole prompt at the most expensive input rate plus the full output
+allowance) is **held** against the order budget in `state.db`, in one
+transaction, so parallel calls and delegated subagents cannot each pass on the
+same money. After the response the hold is settled to the real cost; a call that
+never reached the provider releases it. An order that is exhausted — or a route
+whose price is unknown — stops the call instead of spending it.
+
+What it is not: the providers' own spend limits remain the only externally
+guaranteed cap. A process that dies leaves its reservation held (conservative),
+and a provider that bills above the published rate can exceed the estimate —
+which is exactly why the next call is then refused.
+
+A configured order is the session (`session:<session_id>`), so a restart resumes
+the same budget instead of re-arming it. Delegated subagents inherit the
+parent's order. `cost_limits.enabled: false` disables the check without deleting
+the recorded spend.
+
 ## Database Settings
 
 The `database:` section controls how Hermes opens its SQLite state database

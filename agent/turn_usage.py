@@ -13,7 +13,8 @@ from __future__ import annotations
 import logging
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from decimal import Decimal
+from typing import Any, Dict, List, Optional
 
 from agent.image_token_cost import calibrate_from_usage
 from agent.usage_anchor import capture_usage_anchor, set_usage_anchor
@@ -54,6 +55,35 @@ def _loop_mod():
     import agent.conversation_loop as _cl
 
     return _cl
+
+
+def _openrouter_generation_id(agent: Any, response: Any) -> Any:
+    """The OpenRouter generation id of *response*, or ``None`` off that route.
+
+    Only OpenRouter exposes a generation id whose cost can be fetched later;
+    stamping an id on other routes would create ledger rows nothing can settle.
+    """
+    if (getattr(agent, "provider", "") or "") != "openrouter":
+        return None
+    rid = getattr(response, "id", None)
+    return rid if isinstance(rid, str) and rid.strip() else None
+
+
+def _settle_order_budget(agent: Any, cost_delta: Optional[float]) -> None:
+    """Settle this call's cost-ceiling hold with the amount we just booked.
+
+    An unknown amount (``None``) keeps the worst-case hold in place — missing
+    usage is unknown cost, never free cost. Accounting must never abort a turn,
+    so the traceback goes to the log rather than to the caller.
+    """
+    if getattr(agent, "_pending_call_budget", None) is None:
+        return
+    from agent import cost_budget
+
+    try:
+        cost_budget.settle_pending_call(agent, None if cost_delta is None else Decimal(str(cost_delta)))
+    except Exception:  # a failed settlement must not fail the turn
+        logger.warning("Cost-ceiling settlement failed; the hold stays booked", exc_info=True)
 
 
 def _fold_moa_usage(agent, canonical_usage):
@@ -290,12 +320,20 @@ def record_response_usage(
                 model=agent.model,
                 api_call_count=1,
                 task=getattr(agent, "_turn_route_task", "") or "",
+                # OpenRouter answers with a generation id: it makes this call a
+                # single billable event that can be reconciled to its real cost
+                # exactly once (issue #13). Other routes have no such ledger and
+                # must not invent an id.
+                generation_id=_openrouter_generation_id(agent, response),
             )
         except Exception as e:  # silent loss here undercounts analytics
             logger.debug(
                 "Token persistence failed (session=%s, tokens=%d): %s",
                 agent.session_id, total_tokens, e,
             )
+
+    # Cost ceiling (#13): settle this call's hold against the order budget.
+    _settle_order_budget(agent, _cost_delta)
 
     if agent.verbose_logging:
         logging.debug(f"Token usage: prompt={usage_dict['prompt_tokens']:,}, completion={usage_dict['completion_tokens']:,}, total={usage_dict['total_tokens']:,}")

@@ -590,6 +590,49 @@ CREATE TABLE IF NOT EXISTS session_model_usage (
     PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
 );
 
+-- Each OpenRouter generation is one billable event. No historical rows are
+-- backfilled from logs: an ID without a verified route is not an accounting key.
+CREATE TABLE IF NOT EXISTS openrouter_generation_costs (
+    generation_id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    model TEXT NOT NULL,
+    billing_base_url TEXT NOT NULL DEFAULT '',
+    billing_mode TEXT NOT NULL DEFAULT '',
+    task TEXT NOT NULL DEFAULT '',
+    estimated_cost_usd REAL,
+    actual_cost_usd TEXT,
+    cost_source TEXT,
+    first_seen REAL NOT NULL,
+    reconciled_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_openrouter_generation_session
+    ON openrouter_generation_costs(session_id);
+
+-- Order-scoped cost ceiling (#13). Money columns are TEXT decimal strings so a
+-- sum never drifts through binary floats; the reserve row is the authority for
+-- money already promised to an in-flight call.
+CREATE TABLE IF NOT EXISTS cost_orders (
+    order_id TEXT PRIMARY KEY,
+    limit_usd TEXT NOT NULL,
+    spent_usd TEXT NOT NULL DEFAULT '0',
+    reserved_usd TEXT NOT NULL DEFAULT '0',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cost_reservations (
+    reservation_id TEXT PRIMARY KEY,
+    order_id TEXT NOT NULL REFERENCES cost_orders(order_id) ON DELETE CASCADE,
+    session_id TEXT NOT NULL DEFAULT '',
+    worst_case_usd TEXT NOT NULL,
+    actual_usd TEXT,
+    status TEXT NOT NULL CHECK (status IN ('reserved', 'settled', 'released')),
+    created_at REAL NOT NULL,
+    settled_at REAL
+);
+CREATE INDEX IF NOT EXISTS idx_cost_reservations_order
+    ON cost_reservations(order_id, status);
+
 CREATE TABLE IF NOT EXISTS runtime_epoch (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     epoch INTEGER NOT NULL CHECK (epoch > 0),
