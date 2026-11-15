@@ -8,7 +8,7 @@ redirect ``_model_request_active`` bracket and the response-vs-redirect crossing
 
 from __future__ import annotations
 
-from contextlib import nullcontext, suppress
+from contextlib import nullcontext
 from dataclasses import dataclass
 import logging
 import time
@@ -139,11 +139,11 @@ def perform_api_call(
                 defer_logical_completion=True,
             )
         except BaseException:
-            # The provider never delivered a response: the hold was money that
-            # was never spent. Release it, then let the retry/fallback path run.
+            # A transport error/interrupt does NOT prove the provider never
+            # accepted the request. Keep the durable hold until a verified
+            # no-charge result can release it; never silently re-arm the budget.
             if _budget is not None:
-                with suppress(Exception):
-                    cost_budget.release_pending_call(agent)
+                agent._pending_call_budget = None
             raise
 
     from hermes_cli.middleware import run_llm_execution_middleware

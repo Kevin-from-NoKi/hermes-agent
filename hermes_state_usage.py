@@ -459,8 +459,9 @@ class SessionUsageMixin:
     def reconcile_openrouter_generation_cost(self, generation_id: str, metadata: Optional[dict]) -> str:
         """Settle one already-attributed generation from a verified OpenRouter API reply.
 
-        No HTTP is performed here. Only a present, non-BYOK ``total_cost`` is
-        an actual OpenRouter charge; absent/unparseable cost is not free usage.
+        No HTTP is performed here. A present ``total_cost`` is the amount
+        charged by OpenRouter, including any BYOK platform fee; absent or
+        unparseable cost is not free usage.
         All ledger and aggregate changes commit together; repeated or conflicting
         replies never add another charge. Returns a result code for retry/reporting.
         """
@@ -487,11 +488,12 @@ class SessionUsageMixin:
             if row is None:
                 return "missing"
             route = dict(row)
-            if (data.get("id") not in (None, generation_id)
-                    or data.get("model") not in (None, route["model"])):
-                return "conflict"
-            if cost is None or data.get("is_byok") is True:
+            # The response may name an alias (openrouter/auto), whereas the
+            # generation metadata names the actually served upstream model.
+            if cost is None:
                 return "pending"
+            if data.get("id") != generation_id:
+                return "conflict"
             if route["actual_cost_usd"] is not None:
                 return "duplicate" if Decimal(route["actual_cost_usd"]) == cost else "conflict"
             amount = float(cost)

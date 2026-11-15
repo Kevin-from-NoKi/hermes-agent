@@ -135,7 +135,7 @@ def test_unpriced_route_never_becomes_a_free_call(tmp_path, monkeypatch):
         db.close()
 
 
-def test_provider_failure_releases_the_hold(tmp_path, monkeypatch):
+def test_ambiguous_provider_failure_keeps_the_hold(tmp_path, monkeypatch):
     monkeypatch.setattr(cost_budget, "_pricing_entry", lambda *a, **k: _entry())
     db = SessionDB(tmp_path / "state.db")
     try:
@@ -148,7 +148,7 @@ def test_provider_failure_releases_the_hold(tmp_path, monkeypatch):
         agent._interruptible_api_call = _boom
         with pytest.raises(RuntimeError, match="provider exploded"):
             _run(agent)
-        assert db.get_cost_order("turn-order")["reserved_usd"] == "0.000000"
+        assert Decimal(db.get_cost_order("turn-order")["reserved_usd"]) > 0
         assert db.get_cost_order("turn-order")["spent_usd"] == "0.000000"
     finally:
         db.close()

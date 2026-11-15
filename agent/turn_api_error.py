@@ -80,6 +80,17 @@ def handle_api_error(
     if agent.thinking_callback:
         agent.thinking_callback("")
 
+    from agent.cost_budget import CostLimitExceeded
+    if isinstance(api_error, CostLimitExceeded):
+        # This is a local admission refusal, not a provider failure. Retrying,
+        # rotating credentials or activating a fallback cannot create budget.
+        return _verdict("return", {
+            "final_response": str(api_error), "messages": messages,
+            "api_calls": api_call_count, "completed": False, "failed": True,
+            "error": str(api_error), "failure_reason": "cost_limit",
+            "failure_retryable": False,
+        })
+
     _recovered, active_system_prompt = recover_before_classification(
         agent, api_error, messages=messages, api_messages=api_messages, api_kwargs=api_kwargs,
         active_system_prompt=active_system_prompt,

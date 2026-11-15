@@ -73,9 +73,25 @@ def test_generation_id_route_conflict_never_books_again(tmp_path):
             "gen-same", {"data": {"id": "wrong", "total_cost": 0.02}}
         ) == "conflict"
         assert db.reconcile_openrouter_generation_cost(
+            "gen-same", {"data": {"total_cost": 0.02}}
+        ) == "conflict"
+        assert db.reconcile_openrouter_generation_cost(
             "gen-same", {"data": {"id": "gen-same", "total_cost": -1}}
         ) == "pending"
         assert db.get_session("first")["actual_cost_usd"] is None
+    finally:
+        db.close()
+
+
+def test_generation_metadata_served_alias_and_byok_charge(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        _route(db, "alias", "gen-alias", model="openrouter/auto", estimate=0.01)
+        assert db.reconcile_openrouter_generation_cost(
+            "gen-alias", {"data": {"id": "gen-alias", "model": "vendor/served",
+                                   "total_cost": 0.02, "is_byok": True}}
+        ) == "reconciled"
+        assert db.get_session("alias")["actual_cost_usd"] == pytest.approx(0.02)
     finally:
         db.close()
 

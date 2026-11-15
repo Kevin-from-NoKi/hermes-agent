@@ -131,9 +131,10 @@ glibc's default. Other platforms ignore it.
 
 ## Cost Limits
 
-The `cost_limits:` section caps what a single task ("order") may spend on paid
-model calls. It is **off by default**: Hermes ships no dollar amount, and
-nothing is enforced until you configure one.
+The experimental `cost_limits:` section provides pre-call admission control
+for the main agent loop. It is **off by default**: Hermes ships no dollar amount.
+This is **not yet a hard order-wide spend cap**; do not rely on it as the sole
+protection for a paid account.
 
 ```yaml
 cost_limits:
@@ -141,18 +142,20 @@ cost_limits:
   order_limit_usd: 2.50        # your decision, per task/session
 ```
 
-How it is enforced: before every paid call the worst-case price of that call
-(the whole prompt at the most expensive input rate plus the full output
-allowance) is **held** against the order budget in `state.db`, in one
-transaction, so parallel calls and delegated subagents cannot each pass on the
-same money. After the response the hold is settled to the real cost; a call that
-never reached the provider releases it. An order that is exhausted — or a route
-whose price is unknown — stops the call instead of spending it.
+How it currently works: before a main-loop call, an estimated upper price
+(prompt-size approximation and the configured output allowance) is held in
+`state.db` in one transaction. Parallel calls using that store share the hold;
+delegated subagents inherit an order ID. An exhausted order or an unpriced
+route refuses the main-loop call. OpenRouter's reported charge is reconciled
+by generation ID when available; a missing charge retains the hold. An ambiguous
+transport failure also retains the hold rather than assuming no charge.
 
-What it is not: the providers' own spend limits remain the only externally
-guaranteed cap. A process that dies leaves its reservation held (conservative),
-and a provider that bills above the published rate can exceed the estimate —
-which is exactly why the next call is then refused.
+The prompt approximation is not a proven token upper bound, and provider rates,
+media/server-tool fees, MoA fan-out and auxiliary calls can exceed or bypass the
+estimate. The managed worker session store does not yet implement the order
+ledger methods. Provider-side spend limits, preferably on a dedicated key or
+workspace, are needed for an externally enforced limit. A provider overage is
+booked in full and blocks later admitted calls, not the already charged one.
 
 A configured order is the session (`session:<session_id>`), so a restart resumes
 the same budget instead of re-arming it. Delegated subagents inherit the

@@ -1,10 +1,10 @@
-"""Order-scoped hard cost ceiling for paid model calls (issue #13, Arbeitspaket C).
+"""Experimental order-scoped main-loop admission control (issue #13).
 
 Why "hard" is not a sum: adding up costs after each turn reports money that has
 already been spent — it can never stop the call that overspends the order. This
 module therefore enforces admission BEFORE the provider is called:
 
-1. the next call's **worst-case** price is computed from the pricing table,
+1. the next call's estimated upper price is computed from the pricing table,
    treating every prompt token at the most expensive input-ish rate and the
    whole output allowance at the output rate;
 2. that amount is **reserved** against the order's ceiling in state.db, in one
@@ -21,9 +21,8 @@ Limits of the guarantee (documented in the PR, not hidden):
   remain the only mathematically guaranteed cap.
 - A route without pricing data cannot be bounded. Such a call is refused with
   ``reason="unpriced"`` instead of being treated as free.
-- The prompt estimate is an upper bound derived from the actual request; a
-  provider that bills more than the published rate can exceed it, which is why
-  the settlement books the real amount and the *next* call is then refused.
+- The prompt-size heuristic is NOT a proven token upper bound; media, provider
+  fees and auxiliary/MoA paths remain unbounded. This is not a hard total cap.
 """
 
 from __future__ import annotations
@@ -136,12 +135,11 @@ def configured_limit_usd() -> Optional[Decimal]:
         from hermes_cli.config import load_config_readonly
 
         section = (load_config_readonly() or {}).get("cost_limits") or {}
-    except (ImportError, OSError, RuntimeError, ValueError, TypeError):
-        # A broken or unreadable config must not block accounting; without a
-        # readable ceiling there simply is none.
-        logger.warning("cost_limits could not be read; no ceiling enforced", exc_info=True)
-        return None
-    if not isinstance(section, dict) or section.get("enabled", True) is False:
+    except (ImportError, OSError, RuntimeError, ValueError, TypeError) as exc:
+        raise CostLimitExceeded("configuration", detail="cost limit configuration unreadable") from exc
+    if not isinstance(section, dict):
+        raise CostLimitExceeded("configuration", detail="cost_limits must be a mapping")
+    if section.get("enabled", True) is False:
         return None
     raw = section.get("order_limit_usd")
     if raw is None:
@@ -150,10 +148,11 @@ def configured_limit_usd() -> Optional[Decimal]:
         from hermes_state_usage import _money_usd
 
         limit = _money_usd(raw)
-    except (ImportError, ValueError, TypeError):
-        logger.warning("cost_limits.order_limit_usd=%r is not a usable amount; ceiling disabled", raw)
-        return None
-    return limit if limit > 0 else None
+    except (ImportError, ValueError, TypeError) as exc:
+        raise CostLimitExceeded("configuration", detail="cost_limits.order_limit_usd invalid") from exc
+    if limit <= 0:
+        raise CostLimitExceeded("configuration", detail="cost_limits.order_limit_usd must be positive")
+    return limit
 
 
 def order_id_for(agent: Any, *, create: bool = True) -> Optional[str]:
@@ -175,7 +174,9 @@ def order_id_for(agent: Any, *, create: bool = True) -> Optional[str]:
     db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
     if db is None or not session_id:
-        return None
+        raise CostLimitExceeded("unsafe", detail="configured ceiling needs a session store and session ID")
+    if not callable(getattr(db, "ensure_cost_order", None)):
+        raise CostLimitExceeded("unsafe", detail="session store does not support the order ledger")
     order = f"session:{session_id}"
     if create:
         db.ensure_cost_order(order, limit_usd=str(limit))
@@ -197,8 +198,9 @@ def reserve_for_call(
     if order_id is None:
         return None
     db = getattr(agent, "_session_db", None)
-    if db is None:
-        raise CostLimitExceeded("unsafe", order_id=order_id, detail="no session store to hold the reservation")
+    if db is None or not all(callable(getattr(db, name, None)) for name in
+                             ("reserve_call_cost", "get_cost_order", "settle_call_cost")):
+        raise CostLimitExceeded("unsafe", order_id=order_id, detail="no compatible session store to hold the reservation")
     model = model or getattr(agent, "model", "") or ""
     if not isinstance(model, str):
         model = str(model)
@@ -296,8 +298,8 @@ def estimate_prompt_tokens(api_kwargs: Any, fallback: int = 0) -> int:
 def estimate_max_output_tokens(api_kwargs: Any, fallback: int = 4096) -> int:
     """The output allowance the request may consume (the larger of the two keys)."""
     if isinstance(api_kwargs, dict):
-        for key in ("max_tokens", "max_completion_tokens", "max_output_tokens"):
-            value = api_kwargs.get(key)
-            if isinstance(value, int) and value > 0:
-                return value
+        values = [api_kwargs.get(key) for key in ("max_tokens", "max_completion_tokens", "max_output_tokens")]
+        present = [value for value in values if isinstance(value, int) and not isinstance(value, bool) and value > 0]
+        if present:
+            return max(present)
     return fallback

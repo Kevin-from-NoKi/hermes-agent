@@ -206,4 +206,38 @@ def test_a_disabled_or_unusable_limit_is_not_enforced(monkeypatch):
         "hermes_cli.config.load_config_readonly",
         lambda: {"cost_limits": {"order_limit_usd": "not-a-number"}}, raising=False,
     )
-    assert cost_budget.configured_limit_usd() is None
+    with pytest.raises(cost_budget.CostLimitExceeded, match="configuration"):
+        cost_budget.configured_limit_usd()
+
+def test_configured_ceiling_without_store_must_refuse(monkeypatch):
+    monkeypatch.setattr(cost_budget, "configured_limit_usd", lambda: Decimal("0.50"))
+    agent = _FakeAgent(None)
+    with pytest.raises(cost_budget.CostLimitExceeded, match="session store"):
+        cost_budget.reserve_for_call(agent, prompt_tokens=1, max_output_tokens=1)
+
+def test_worker_store_without_budget_ledger_fails_closed(monkeypatch):
+    _priced(monkeypatch)
+    agent = _FakeAgent(object(), order_id="o-worker")
+    with pytest.raises(cost_budget.CostLimitExceeded) as error:
+        cost_budget.reserve_for_call(agent, prompt_tokens=1, max_output_tokens=1)
+    assert error.value.reason == "unsafe"
+
+def test_output_allowance_uses_largest_value_not_first():
+    assert cost_budget.estimate_max_output_tokens({"max_tokens": 16, "max_output_tokens": 200}) == 200
+
+def test_failed_settlement_retains_pending_handle(tmp_path, monkeypatch):
+    _priced(monkeypatch)
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        db.ensure_cost_order("o6", limit_usd="1.00")
+        agent = _FakeAgent(db, order_id="o6")
+        cost_budget.reserve_for_call(agent, prompt_tokens=100, max_output_tokens=100)
+        original = db.settle_call_cost
+        monkeypatch.setattr(db, "settle_call_cost", lambda *a: (_ for _ in ()).throw(RuntimeError("db unavailable")))
+        with pytest.raises(RuntimeError, match="db unavailable"):
+            cost_budget.settle_pending_call(agent, Decimal("0.001"))
+        assert agent._pending_call_budget is not None
+        monkeypatch.setattr(db, "settle_call_cost", original)
+        assert cost_budget.settle_pending_call(agent, Decimal("0.001")) == "settled"
+    finally:
+        db.close()
